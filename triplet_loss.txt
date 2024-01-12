@@ -1,0 +1,86 @@
+class VICReg(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.num_features = int(args.mlp.split("-")[-1])
+        self.backbone, self.embedding = resnet.__dict__[args.arch](
+            zero_init_residual=True
+        )
+        self.projector = Projector(args, self.embedding)
+
+    def forward(self, xa, xp, xn):
+        za = self.projector(self.backbone(xa)) # N*D
+        zp = self.projector(self.backbone(xp)) # N*D
+        zn = self.projector(self.backbone(xn)) # N*D
+		
+        #  invariance loss
+        # repr_loss = F.mse_loss(x, y)
+
+        za = torch.cat(FullGatherLayer.apply(za), dim=0)
+        zp = torch.cat(FullGatherLayer.apply(zp), dim=0)
+		zn = torch.cat(FullGatherLayer.apply(zn), dim=0)
+        za = za - za.mean(dim=0)
+        zp = zp - zp.mean(dim=0)
+		zn = zn - zn.mean(dim=0)
+
+        # variance loss
+        std_a = torch.sqrt(za.var(dim=0) + 0.0001)
+        std_p = torch.sqrt(zp.var(dim=0) + 0.0001)
+		std_n = torch.sqrt(zn.var(dim=0) + 0.0001)
+        std_loss = torch.mean(F.relu(1 - std_a)) / 3 + torch.mean(F.relu(1 - std_p)) / 3 + torch.mean(F.relu(1 - std_n)) / 3
+
+        # convariance loss
+        cov_za = (za.T @ za) / (self.args.batch_size - 1)
+        cov_zp = (zp.T @ zp) / (self.args.batch_size - 1)
+		cov_zn = (zn.T @ zn) / (self.args.batch_size - 1)
+        cov_loss = off_diagonal(cov_za).pow_(2).sum().div(
+            self.num_features
+        ) + off_diagonal(cov_zp).pow_(2).sum().div(self.num_features)
+		+ off_diagonal(cov_zn).pow_(2).sum().div(self.num_features)
+
+        loss = (
+            self.args.sim_coeff * repr_loss
+            + self.args.std_coeff * std_loss
+            + self.args.cov_coeff * cov_loss
+        )
+        return loss
+
+
+def Projector(args, embedding):
+    mlp_spec = f"{embedding}-{args.mlp}"
+    layers = []
+    f = list(map(int, mlp_spec.split("-")))
+    for i in range(len(f) - 2):
+        layers.append(nn.Linear(f[i], f[i + 1]))
+        layers.append(nn.BatchNorm1d(f[i + 1]))
+        layers.append(nn.ReLU(True))
+    layers.append(nn.Linear(f[-2], f[-1], bias=False))
+    return nn.Sequential(*layers)
+
+
+def exclude_bias_and_norm(p):
+    return p.ndim == 1
+
+
+def off_diagonal(x):
+    n, m = x.shape
+    assert n == m
+    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+	
+class FullGatherLayer(torch.autograd.Function):
+    """
+    Gather tensors from all process and support backward propagation
+    for the gradients across processes.
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        output = [torch.zeros_like(x) for _ in range(dist.get_world_size())]
+        dist.all_gather(output, x)
+        return tuple(output)
+
+    @staticmethod
+    def backward(ctx, *grads):
+        all_gradients = torch.stack(grads)
+        dist.all_reduce(all_gradients)
+        return all_gradients[dist.get_rank()]
